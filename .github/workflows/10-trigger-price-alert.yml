@@ -6,8 +6,11 @@
 # 因此原生 workflow 上触发价告警永远不会响 —— 本 workflow 专门补这个缺口。
 #
 # 调度：工作日北京时间 15:05（A股收盘）+ 16:10（港股收盘）
-# 命中后：创建/更新一个 GitHub Issue（零配置通知，走 GitHub 邮件/App 推送）
+# 命中后：创建 GitHub Issue（零配置通知，走 GitHub 邮件/App 推送）
 #         若配置了 WECHAT_WEBHOOK_URL secret，同时推企业微信
+#
+# 注意：GitHub 不允许在 step 级 if 里使用 secrets 上下文，
+#       因此"是否配置了 webhook"一律在 shell 内判断。
 # =============================================================================
 name: 触发价监控
 
@@ -47,49 +50,50 @@ jobs:
         id: result
         run: |
           if [ -f alert_result.json ]; then
-            echo "hit_count=$(python -c "import json;print(json.load(open('alert_result.json'))['hit_count'])")" >> "$GITHUB_OUTPUT"
+            HITS=$(python -c "import json;print(json.load(open('alert_result.json',encoding='utf-8'))['hit_count'])")
           else
-            echo "hit_count=0" >> "$GITHUB_OUTPUT"
+            HITS=0
           fi
+          echo "hit_count=$HITS" >> "$GITHUB_OUTPUT"
+          echo "命中数量：$HITS"
 
       - name: 命中则开 Issue 通知
         if: steps.result.outputs.hit_count != '0'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TITLE="🎯 触发价命中 $(date '+%Y-%m-%d %H:%M') UTC"
-          {
-            echo "以下持仓已跌至买入触发价："
-            echo
-            echo "| 标的 | 代码 | 现价 | 触发价 | 说明 |"
-            echo "|:---|:---|---:|---:|:---|"
-            python -c "
+          python - <<'PY' > issue_body.md
           import json
-          d = json.load(open('alert_result.json'))
-          for r in d['hits']:
-              print(f\"| {r['name']} | {r['code']} | {r['price']} | {r['trigger']} | {r['note']} |\")
-          "
-            echo
-            echo "数据源：$(python -c "import json;print(json.load(open('alert_result.json'))['source'])")"
-            echo
-            echo "> 茅台/腾讯为参考价（集中度约束优先于触发价），不计入命中。"
-          } > issue_body.md
-          gh issue create --title "$TITLE" --body-file issue_body.md || \
-            echo "Issue 创建失败（可能 issues 未开启），已忽略"
+          d = json.load(open("alert_result.json", encoding="utf-8"))
+          print("以下持仓已跌至买入触发价：\n")
+          print("| 标的 | 代码 | 现价 | 触发价 | 说明 |")
+          print("|:---|:---|---:|---:|:---|")
+          for r in d["hits"]:
+              print(f"| {r['name']} | {r['code']} | {r['price']} | {r['trigger']} | {r['note']} |")
+          print(f"\n数据源：{d['source']}")
+          print("\n> 茅台/腾讯为参考价（集中度约束优先于触发价），不计入命中。")
+          PY
+          gh issue create \
+            --title "触发价命中 $(date -u '+%Y-%m-%d %H:%M') UTC" \
+            --body-file issue_body.md || echo "Issue 创建失败，已忽略"
 
       - name: 命中则推企业微信（若已配置）
-        if: steps.result.outputs.hit_count != '0' && secrets.WECHAT_WEBHOOK_URL != ''
+        if: steps.result.outputs.hit_count != '0'
         env:
           WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
         run: |
+          if [ -z "${WECHAT_WEBHOOK_URL:-}" ]; then
+            echo "未配置 WECHAT_WEBHOOK_URL，跳过企业微信推送"
+            exit 0
+          fi
           python - <<'PY'
           import json, os, urllib.request
-          url = os.environ["WECHAT_WEBHOOK_URL"]
           d = json.load(open("alert_result.json", encoding="utf-8"))
           lines = [f"- {r['name']}({r['code']}) 现价 {r['price']} ≤ 触发价 {r['trigger']}（{r['note']}）" for r in d["hits"]]
-          content = "🎯 **触发价命中**\n" + "\n".join(lines) + f"\n\n数据源：{d['source']}"
+          content = "**触发价命中**\n" + "\n".join(lines) + f"\n\n数据源：{d['source']}"
           body = json.dumps({"msgtype": "markdown", "markdown": {"content": content}}).encode()
-          req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+          req = urllib.request.Request(os.environ["WECHAT_WEBHOOK_URL"], data=body,
+                                       headers={"Content-Type": "application/json"})
           print(urllib.request.urlopen(req, timeout=15).read().decode())
           PY
 
@@ -100,3 +104,4 @@ jobs:
           name: price-alert-result
           path: alert_result.json
           retention-days: 30
+          if-no-files-found: ignore
