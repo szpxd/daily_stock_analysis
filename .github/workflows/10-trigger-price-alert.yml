@@ -133,6 +133,42 @@ jobs:
           print(urllib.request.urlopen(req, timeout=15).read().decode())
           PY
 
+      - name: 命中则推 PushPlus（个人微信，若已配置）
+        if: steps.result.outputs.hit_count != '0' || inputs.notify_test
+        env:
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          NOTIFY_TEST: ${{ inputs.notify_test }}
+        run: |
+          if [ -z "${PUSHPLUS_TOKEN:-}" ]; then
+            echo "未配置 PUSHPLUS_TOKEN，跳过 PushPlus 推送"
+            exit 0
+          fi
+          python - <<'PY'
+          import json, os, urllib.request
+          try:
+              d = json.load(open("alert_result.json", encoding="utf-8"))
+          except Exception:
+              d = {"hits": [], "rows": [], "source": "n/a"}
+          is_test = str(os.environ.get("NOTIFY_TEST", "")).lower() == "true"
+          hits = d.get("hits") or []
+          title = "触发价命中" if hits else ("触发价监控自检" if is_test else "触发价监控")
+          rows = hits or d.get("rows") or []
+          if rows:
+              body_html = "<br>".join(
+                  f"{r['name']}({r['code']}) 现价 {r['price']} ≤ 触发价 {r['trigger']}（{r['note']}）" for r in rows)
+          else:
+              body_html = "通知链路自检成功：PushPlus 推送通道正常。" if is_test else "当前无标的触发买入价。"
+          payload = json.dumps({
+              "token": os.environ["PUSHPLUS_TOKEN"],
+              "title": title,
+              "content": body_html,
+              "template": "html",
+          }).encode("utf-8")
+          req = urllib.request.Request("https://www.pushplus.plus/send", data=payload,
+                                       headers={"Content-Type": "application/json"})
+          print(urllib.request.urlopen(req, timeout=15).read().decode("utf-8"))
+          PY
+
       - name: 保存检查结果
         uses: actions/upload-artifact@v4
         if: always()
