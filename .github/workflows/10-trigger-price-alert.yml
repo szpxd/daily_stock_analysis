@@ -9,8 +9,12 @@
 # 命中后：创建 GitHub Issue（零配置通知，走 GitHub 邮件/App 推送）
 #         若配置了 WECHAT_WEBHOOK_URL secret，同时推企业微信
 #
-# 注意：GitHub 不允许在 step 级 if 里使用 secrets 上下文，
-#       因此"是否配置了 webhook"一律在 shell 内判断。
+# 手动测试：Actions → 触发价监控 → Run workflow → 勾选 notify_test
+#          会创建一条"通知链路自检" Issue，验证推送通道是否通。
+#
+# 坑位备忘（已踩）：
+#   GitHub 不允许在 step 级 if 里使用 secrets 上下文，
+#   因此"是否配置了 webhook"一律在 shell 内判断。
 # =============================================================================
 name: 触发价监控
 
@@ -19,6 +23,11 @@ on:
     - cron: '5 7 * * 1-5'    # UTC 07:05 = 北京 15:05（A股收盘后）
     - cron: '10 8 * * 1-5'   # UTC 08:10 = 北京 16:10（港股收盘后）
   workflow_dispatch:
+    inputs:
+      notify_test:
+        description: '通知链路自检（会创建一条测试 Issue）'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -57,25 +66,52 @@ jobs:
           echo "hit_count=$HITS" >> "$GITHUB_OUTPUT"
           echo "命中数量：$HITS"
 
-      - name: 命中则开 Issue 通知
-        if: steps.result.outputs.hit_count != '0'
+      - name: 生成通知正文
+        if: steps.result.outputs.hit_count != '0' || inputs.notify_test
+        env:
+          NOTIFY_TEST: ${{ inputs.notify_test }}
+        run: |
+          python - <<'PY' > issue_body.md
+          import json, os
+          test = str(os.environ.get("NOTIFY_TEST", "")).lower() == "true"
+          try:
+              d = json.load(open("alert_result.json", encoding="utf-8"))
+          except Exception:
+              d = {"hits": [], "rows": [], "source": "n/a"}
+
+          def row(r):
+              price = r["price"] if r["price"] is not None else "N/A"
+              print(f"| {r['name']} | {r['code']} | {price} | {r['trigger']} | {r['note']} |")
+
+          if d["hits"]:
+              print("以下持仓已跌至买入触发价：\n")
+          elif test:
+              print("> 通知链路自检：本条不是真实触发，仅用于验证 GitHub 通知能否送达。\n")
+          print("| 标的 | 代码 | 现价 | 触发价 | 说明 |")
+          print("|:---|:---|---:|---:|:---|")
+          for r in (d["hits"] if d["hits"] else d.get("rows", [])):
+              row(r)
+          print(f"\n数据源：{d['source']}")
+          if test and not d["hits"]:
+              print("\n若您能看到本条，说明 GitHub → 邮件 / App 推送链路正常。")
+          else:
+              print("\n> 茅台/腾讯为参考价（集中度约束优先于触发价），不计入命中。")
+          PY
+          echo "--- 正文预览 ---"
+          cat issue_body.md
+
+      - name: 创建 Issue 通知
+        if: steps.result.outputs.hit_count != '0' || inputs.notify_test
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python - <<'PY' > issue_body.md
-          import json
-          d = json.load(open("alert_result.json", encoding="utf-8"))
-          print("以下持仓已跌至买入触发价：\n")
-          print("| 标的 | 代码 | 现价 | 触发价 | 说明 |")
-          print("|:---|:---|---:|---:|:---|")
-          for r in d["hits"]:
-              print(f"| {r['name']} | {r['code']} | {r['price']} | {r['trigger']} | {r['note']} |")
-          print(f"\n数据源：{d['source']}")
-          print("\n> 茅台/腾讯为参考价（集中度约束优先于触发价），不计入命中。")
-          PY
-          gh issue create \
-            --title "触发价命中 $(date -u '+%Y-%m-%d %H:%M') UTC" \
-            --body-file issue_body.md || echo "Issue 创建失败，已忽略"
+          if [ "${{ inputs.notify_test }}" = "true" ]; then
+            TITLE="通知链路自检 $(date -u '+%Y-%m-%d %H:%M') UTC"
+          else
+            TITLE="触发价命中 $(date -u '+%Y-%m-%d %H:%M') UTC"
+          fi
+          gh issue create --title "$TITLE" --body-file issue_body.md \
+            || echo "Issue 创建失败（请确认仓库 Issues 已开启、workflow 权限为 write）"
 
       - name: 命中则推企业微信（若已配置）
         if: steps.result.outputs.hit_count != '0'
