@@ -1,0 +1,102 @@
+# =============================================================================
+# 触发价监控（彭先生持仓专用）
+#
+# 存在意义：项目原生 workflow(00-daily-analysis.yml) 跑的是 main.py 一次性命令，
+# 而项目的"触发价告警中心"依赖 AlertWorker，只在常驻 `--schedule` 进程注册生效。
+# 因此原生 workflow 上触发价告警永远不会响 —— 本 workflow 专门补这个缺口。
+#
+# 调度：工作日北京时间 15:05（A股收盘）+ 16:10（港股收盘）
+# 命中后：创建/更新一个 GitHub Issue（零配置通知，走 GitHub 邮件/App 推送）
+#         若配置了 WECHAT_WEBHOOK_URL secret，同时推企业微信
+# =============================================================================
+name: 触发价监控
+
+on:
+  schedule:
+    - cron: '5 7 * * 1-5'    # UTC 07:05 = 北京 15:05（A股收盘后）
+    - cron: '10 8 * * 1-5'   # UTC 08:10 = 北京 16:10（港股收盘后）
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: price-alert
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 检查触发价
+        id: check
+        continue-on-error: true
+        run: python scripts/price_alert_check.py
+
+      - name: 读取结果
+        id: result
+        run: |
+          if [ -f alert_result.json ]; then
+            echo "hit_count=$(python -c "import json;print(json.load(open('alert_result.json'))['hit_count'])")" >> "$GITHUB_OUTPUT"
+          else
+            echo "hit_count=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 命中则开 Issue 通知
+        if: steps.result.outputs.hit_count != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TITLE="🎯 触发价命中 $(date '+%Y-%m-%d %H:%M') UTC"
+          {
+            echo "以下持仓已跌至买入触发价："
+            echo
+            echo "| 标的 | 代码 | 现价 | 触发价 | 说明 |"
+            echo "|:---|:---|---:|---:|:---|"
+            python -c "
+          import json
+          d = json.load(open('alert_result.json'))
+          for r in d['hits']:
+              print(f\"| {r['name']} | {r['code']} | {r['price']} | {r['trigger']} | {r['note']} |\")
+          "
+            echo
+            echo "数据源：$(python -c "import json;print(json.load(open('alert_result.json'))['source'])")"
+            echo
+            echo "> 茅台/腾讯为参考价（集中度约束优先于触发价），不计入命中。"
+          } > issue_body.md
+          gh issue create --title "$TITLE" --body-file issue_body.md || \
+            echo "Issue 创建失败（可能 issues 未开启），已忽略"
+
+      - name: 命中则推企业微信（若已配置）
+        if: steps.result.outputs.hit_count != '0' && secrets.WECHAT_WEBHOOK_URL != ''
+        env:
+          WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
+        run: |
+          python - <<'PY'
+          import json, os, urllib.request
+          url = os.environ["WECHAT_WEBHOOK_URL"]
+          d = json.load(open("alert_result.json", encoding="utf-8"))
+          lines = [f"- {r['name']}({r['code']}) 现价 {r['price']} ≤ 触发价 {r['trigger']}（{r['note']}）" for r in d["hits"]]
+          content = "🎯 **触发价命中**\n" + "\n".join(lines) + f"\n\n数据源：{d['source']}"
+          body = json.dumps({"msgtype": "markdown", "markdown": {"content": content}}).encode()
+          req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+          print(urllib.request.urlopen(req, timeout=15).read().decode())
+          PY
+
+      - name: 保存检查结果
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: price-alert-result
+          path: alert_result.json
+          retention-days: 30
